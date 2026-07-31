@@ -1682,18 +1682,19 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 void ShowAboutWindow(HWND owner) {
-    wchar_t text[512];
-    swprintf_s(text,
-        L"WindowPosButton %s\n\n"
+    // Do not use a fixed formatting buffer here.  The English copy is longer
+    // than the former Korean copy and can exceed 512 characters; swprintf_s
+    // then invokes the invalid-parameter handler and terminates the process.
+    const std::wstring text = std::wstring(L"WindowPosButton ") + kAppVersion +
+        L"\n\n"
         L"Adds buttons to the left of the minimize button in every window title bar:\n\n"
-        L"  • Snap left (50%% width; Shift+left click: 30%% width; right click: 70%% width)\n"
-        L"  • Snap right (50%% width; Shift+left click: 30%% width; right click: 70%% width)\n"
+        L"  • Snap left (50% width; Shift+left click: 30% width; right click: 70% width)\n"
+        L"  • Snap right (50% width; Shift+left click: 30% width; right click: 70% width)\n"
         L"  • Move to next monitor (cycles through display layout order; right click: expand across all monitors)\n"
-        L"  • Center at 80%% (80%% of the current display width at 16:9, centered in the work area; right click: full height)\n\n"
+        L"  • Center at 80% (80% of the current display width at 16:9, centered in the work area; right click: full height)\n\n"
         L"This application runs with administrator privileges so the buttons are available on elevated windows.\n\n"
-        L"Copyright (c) 2026 jintaeks@gmail.com",
-        kAppVersion);
-    MessageBoxW(owner, text, L"About WindowPosButton", MB_OK | MB_ICONINFORMATION);
+        L"Copyright (c) 2026 jintaeks@gmail.com";
+    MessageBoxW(owner, text.c_str(), L"About WindowPosButton", MB_OK | MB_ICONINFORMATION);
 }
 
 void CreateTrayIcon();
