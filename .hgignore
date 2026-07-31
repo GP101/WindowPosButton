@@ -1,0 +1,8 @@
+syntax: glob
+.claude/*
+x64/*
+.vs/*
+WindowPosButton/WindowPosButton.vcxproj.user
+WindowPosButton/WindowPosButton.aps
+desktop.ini
+.git/*
