@@ -1090,6 +1090,29 @@ BOOL CALLBACK CollectMonitorWorkArea(HMONITOR monitor, HDC, LPRECT, LPARAM data)
     return TRUE;
 }
 
+// GetWindowRect includes the invisible resize border on many DWM-managed
+// windows.  Use the visible frame when translating a window between monitors
+// so an edge-aligned window remains edge-aligned after the move.
+RECT GetVisibleFrameRect(HWND hwnd, const RECT& fallbackRect) {
+    RECT frameRect{};
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                        &frameRect, sizeof(frameRect)))) {
+        return frameRect;
+    }
+    return fallbackRect;
+}
+
+RECT GetWindowRectForVisibleFrame(HWND hwnd, const RECT& visibleRect,
+                                  const RECT& currentWindowRect) {
+    RECT frameRect = GetVisibleFrameRect(hwnd, currentWindowRect);
+    LONG leftInset = frameRect.left - currentWindowRect.left;
+    LONG topInset = frameRect.top - currentWindowRect.top;
+    LONG rightInset = currentWindowRect.right - frameRect.right;
+    LONG bottomInset = currentWindowRect.bottom - frameRect.bottom;
+    return {visibleRect.left - leftInset, visibleRect.top - topInset,
+            visibleRect.right + rightInset, visibleRect.bottom + bottomInset};
+}
+
 LONG ScaleWindowPosition(LONG position, LONG sourceStart, LONG sourceSize,
                          LONG windowSize, LONG destinationStart, LONG destinationSize) {
     LONG sourceRange = sourceSize - windowSize;
@@ -1141,7 +1164,8 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
     }
 
     bool wasMaximized = placement.showCmd == SW_SHOWMAXIMIZED;
-    RECT sourceRect = wasMaximized ? placement.rcNormalPosition : currentRect;
+    RECT sourceOuterRect = wasMaximized ? placement.rcNormalPosition : currentRect;
+    RECT sourceRect = GetVisibleFrameRect(hwnd, sourceOuterRect);
     LONG sourceWidth = source->work.right - source->work.left;
     LONG sourceHeight = source->work.bottom - source->work.top;
     LONG destinationWidth = destination.work.right - destination.work.left;
@@ -1160,13 +1184,13 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
 
     bool moved = false;
     if (wasMaximized) {
-        placement.rcNormalPosition = destinationRect;
+        placement.rcNormalPosition = GetWindowRectForVisibleFrame(hwnd, destinationRect, currentRect);
         placement.showCmd = SW_SHOWNORMAL;
         moved = SetWindowPlacement(hwnd, &placement) != FALSE;
         if (moved) ShowWindow(hwnd, SW_MAXIMIZE);
     } else {
-        moved = SetWindowPos(hwnd, nullptr, destinationRect.left, destinationRect.top,
-                             width, height, SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+        SetWindowPosForVisibleFrame(hwnd, destinationRect);
+        moved = true;
     }
 
     if (!moved) {
