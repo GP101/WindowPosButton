@@ -65,6 +65,17 @@ constexpr UINT kTrayRecoveryRetryCount = 4;
 constexpr UINT_PTR kHorizontalResizeDoubleClickTimerId = 3;
 constexpr UINT kHorizontalResizeDoubleClickIntervalMs = 15;
 
+// Delay used by the per-window settle timer (id = the target HWND's own
+// value, see DispatchUpdate and the WM_TIMER default case). Re-armed on
+// every dispatch, so it only fires once, this long after the *last* one for
+// a given window — giving DWM's caption-button-bounds refresh and the
+// target's own DPI-change handling time to catch up before one final
+// confirmation pass runs. Without it, a fast-moving burst of
+// EVENT_OBJECT_LOCATIONCHANGE (e.g. dragging a window across monitors with
+// different DPI) can leave the overlay buttons sized from whichever
+// mid-transition sample happened to be the last one measured.
+constexpr UINT kOverlaySettleDelayMs = 150;
+
 constexpr wchar_t kAppVersion[] = L"1.1";
 
 enum class ButtonAction { SnapLeft, SnapRight, MoveNextMonitor, Center80 };
@@ -119,6 +130,12 @@ HWINEVENTHOOK g_hookObjectLifecycle = nullptr;
 HWINEVENTHOOK g_hookReorder = nullptr;
 
 std::wstring g_diagnosticLogPath;
+// Opened once in InitializeDiagnosticLog and kept open for the process
+// lifetime; AppendDiagnosticLine writes+flushes to it instead of
+// re-opening/closing the file on every single log line (which used to mean
+// a CreateFile/CloseHandle pair per WinEvent — see EVENT_OBJECT_REORDER,
+// which fires for the whole desktop's Z-order and was the dominant cost).
+FILE* g_diagnosticLogFile = nullptr;
 
 template <typename T>
 struct ComPtr {
@@ -174,6 +191,10 @@ struct LocationEventLogState {
 };
 
 std::unordered_map<HWND, LocationEventLogState> g_locationEventLogs;
+// EVENT_OBJECT_REORDER's hwnd is typically the desktop container, not a
+// specific window (see the WinEventProc case), so a single global throttle
+// state is enough — no need to key it per-hwnd like g_locationEventLogs.
+LocationEventLogState g_reorderEventLog;
 
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -187,17 +208,14 @@ std::string WideToUtf8(const std::wstring& value) {
 }
 
 void AppendDiagnosticLine(const char* line) {
-    if (g_diagnosticLogPath.empty() || !line) return;
-
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, g_diagnosticLogPath.c_str(), L"ab") != 0 || !file) return;
-    fputs(line, file);
-    fputs("\r\n", file);
-    fclose(file);
+    if (!g_diagnosticLogFile || !line) return;
+    fputs(line, g_diagnosticLogFile);
+    fputs("\r\n", g_diagnosticLogFile);
+    fflush(g_diagnosticLogFile);
 }
 
 void LogDiagnostic(const char* format, ...) {
-    if (g_diagnosticLogPath.empty()) return;
+    if (!g_diagnosticLogFile) return;
 
     char message[2048] = {};
     va_list args;
@@ -218,7 +236,7 @@ void LogDiagnostic(const char* format, ...) {
 }
 
 void LogWindowDiagnostic(HWND hwnd, const char* eventName, const char* format = nullptr, ...) {
-    if (g_diagnosticLogPath.empty()) return;
+    if (!g_diagnosticLogFile) return;
 
     char detail[1024] = {};
     if (format) {
@@ -254,7 +272,14 @@ void InitializeDiagnosticLog() {
     DeleteFileW(previousPath.c_str());
     MoveFileExW(g_diagnosticLogPath.c_str(), previousPath.c_str(), MOVEFILE_REPLACE_EXISTING);
 
+    _wfopen_s(&g_diagnosticLogFile, g_diagnosticLogPath.c_str(), L"ab");
     LogDiagnostic("app-start version=1.1 log=\"%s\"", WideToUtf8(g_diagnosticLogPath).c_str());
+}
+
+void ShutdownDiagnosticLog() {
+    if (!g_diagnosticLogFile) return;
+    fclose(g_diagnosticLogFile);
+    g_diagnosticLogFile = nullptr;
 }
 
 const char* WinEventName(DWORD event) {
@@ -287,6 +312,26 @@ void LogLocationEventThrottled(HWND hwnd) {
     }
 }
 
+// EVENT_OBJECT_REORDER fires for every Z-order change on the whole desktop
+// (any process, not just windows we track), so — like
+// LogLocationEventThrottled above — this collapses a burst into one summary
+// line per second instead of logging (and disk-writing) every single one.
+void LogReorderEventThrottled(HWND hwnd) {
+    ULONGLONG now = GetTickCount64();
+    g_reorderEventLog.count++;
+    if (g_reorderEventLog.lastFlushTick == 0) {
+        g_reorderEventLog.lastFlushTick = now;
+    }
+
+    if (now - g_reorderEventLog.lastFlushTick >= 1000) {
+        LogWindowDiagnostic(hwnd, "EVENT_OBJECT_REORDER",
+                            "count=%u elapsed=%llums", g_reorderEventLog.count,
+                            now - g_reorderEventLog.lastFlushTick);
+        g_reorderEventLog.count = 0;
+        g_reorderEventLog.lastFlushTick = now;
+    }
+}
+
 // Returns true if this window looks like a normal top-level app window with
 // a title bar that has a Minimize button, i.e. a window we should attach our
 // buttons to. Our own overlay windows are WS_POPUP with no caption, so they
@@ -314,10 +359,9 @@ bool ShouldTrackWindow(HWND hwnd) {
     return true;
 }
 
-UINT GetMonitorDpi(HWND hwnd) {
-    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+UINT GetMonitorDpi(HMONITOR hMonitor) {
     UINT dpiX = 96, dpiY = 96;
-    if (SUCCEEDED(GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) {
+    if (hMonitor && SUCCEEDED(GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) {
         return dpiX;
     }
     return 96;
@@ -331,13 +375,20 @@ bool ComputeButtonRect(HWND hwnd, int slot, bool shrink, RECT* outRect) {
     RECT captionButtons{};
     HRESULT hr = DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS,
                                         &captionButtons, sizeof(captionButtons));
-    
+
     bool validBounds = SUCCEEDED(hr) && (captionButtons.right > captionButtons.left);
 
     RECT windowRect{};
     if (!GetWindowRect(hwnd, &windowRect)) return false;
 
-    UINT monitorDpi = GetMonitorDpi(hwnd);
+    // Query the monitor once and reuse it below for both the DPI lookup and
+    // the work-area clamp. Calling MonitorFromWindow a second time later (as
+    // this used to) left a window, while dragging across a DPI boundary,
+    // where Windows' "nearest monitor" verdict could flip between the two
+    // calls, making the DPI and work-area reads disagree about which
+    // monitor they belong to.
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    UINT monitorDpi = GetMonitorDpi(monitor);
     LONG captionLeft = 0;
     LONG top = 0;
     LONG bottom = 0;
@@ -380,7 +431,6 @@ bool ComputeButtonRect(HWND hwnd, int slot, bool shrink, RECT* outRect) {
     // never let their top edge begin off-screen where Windows would clip them.
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
-    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
         if (top < monitorInfo.rcWork.top) {
             top = monitorInfo.rcWork.top;
@@ -794,7 +844,7 @@ void ApplyUpdateResult(TrackedWindow& window, const UpdateResult& result) {
         ShowWindow(window.nextMonitor.hwnd, SW_HIDE);
         ShowWindow(window.center80.hwnd, SW_HIDE);
         if (result.retryLater && IsWindow(target) && !IsIconic(target)) {
-            SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(target), 150, nullptr);
+            SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(target), kOverlaySettleDelayMs, nullptr);
         }
         return;
     }
@@ -870,10 +920,22 @@ void SpawnMeasureThread(HWND target) {
 // snap animation) coalesce onto whichever measurement thread is already in
 // flight for that window, exactly like the old updating/updatePending guard
 // did for synchronous calls.
-void DispatchUpdate(HWND target) {
+//
+// `rearmSettleTimer` re-arms the per-window settle timer (see
+// kOverlaySettleDelayMs) so one confirmation pass runs shortly after the
+// last dispatch. Callers reacting to a live event (window moved, shown,
+// activated, display topology changed, ...) should leave this at its
+// default of true. Pass false only when this call *is* that confirmation
+// pass firing (the WM_TIMER default case) — otherwise it would re-arm
+// itself and never stop ticking.
+void DispatchUpdate(HWND target, bool rearmSettleTimer = true) {
     auto it = g_windows.find(target);
     if (it == g_windows.end()) return;
     TrackedWindow& window = *it->second;
+
+    if (rearmSettleTimer) {
+        SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(target), kOverlaySettleDelayMs, nullptr);
+    }
 
     if (window.dispatchInFlight) {
         window.dispatchAgainRequested = true;
@@ -1275,6 +1337,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
     if (event == EVENT_OBJECT_LOCATIONCHANGE) {
         LogLocationEventThrottled(hwnd);
+    } else if (event == EVENT_OBJECT_REORDER) {
+        LogReorderEventThrottled(hwnd);
     } else {
         LogWindowDiagnostic(hwnd, WinEventName(event));
     }
@@ -1820,12 +1884,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ReassertForegroundZOrder();
                 return 0;
             }
-            // Retry from ApplyUpdateResult: a just-restored window's real
-            // position wasn't settled yet when we last checked it. wParam
-            // is the target HWND itself.
+            // Fires either as the retry from ApplyUpdateResult (a
+            // just-restored window's real position wasn't settled yet when
+            // we last checked it) or as the settle-confirmation timer armed
+            // by DispatchUpdate (see kOverlaySettleDelayMs) — both share
+            // this one per-window timer slot, keyed by the target HWND
+            // itself as wParam. Pass rearmSettleTimer=false: this call *is*
+            // the confirmation pass, so it must not re-arm itself.
             KillTimer(hwnd, wParam);
             LogWindowDiagnostic(reinterpret_cast<HWND>(wParam), "WM_TIMER.retry");
-            DispatchUpdate(reinterpret_cast<HWND>(wParam));
+            DispatchUpdate(reinterpret_cast<HWND>(wParam), /*rearmSettleTimer=*/false);
             return 0;
         }
         case WM_DESTROY: {
@@ -2004,5 +2072,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     ReleaseMutex(mutex);
     CloseHandle(mutex);
+    ShutdownDiagnosticLog();
     return static_cast<int>(msg.wParam);
 }
