@@ -45,6 +45,7 @@ constexpr UINT WM_OVERLAY_RESULT = WM_APP + 2;
 constexpr UINT ID_TRAY_ABOUT = 1;
 constexpr UINT ID_TRAY_STARTUP = 3;
 constexpr UINT ID_TRAY_EXIT = 2;
+constexpr UINT ID_TRAY_HIDE_REPOSITION = 4;
 constexpr UINT ID_TRAY_ICON = 1;
 
 // Recurring timer id (SetTimer on g_hMain). Distinct from the per-window
@@ -76,15 +77,8 @@ constexpr UINT kHorizontalResizeDoubleClickIntervalMs = 15;
 // mid-transition sample happened to be the last one measured.
 constexpr UINT kOverlaySettleDelayMs = 150;
 
-// How long MoveWindowToNextMonitor keeps a (non-maximized) window hidden
-// after placing it, before RevealMonitorMovePlacementIfPending re-applies
-// the placement once more and shows it. When a window crosses onto a
-// differently-scaled monitor, Windows sends it WM_DPICHANGED, and a
-// DPI-aware target app's own handling of that message can resize/reposition
-// itself right after we place it — overwriting the size/position ratio we
-// just computed. This is longer than kOverlaySettleDelayMs because it waits
-// on a third-party app's own message handling, not just our own DWM
-// queries.
+// Allows a DPI-aware target app's WM_DPICHANGED handling to settle before we
+// reapply the monitor-work-area-relative placement and reveal the window.
 constexpr UINT kMonitorMoveReassertDelayMs = 300;
 
 constexpr wchar_t kAppVersion[] = L"1.2";
@@ -111,11 +105,8 @@ struct TrackedWindow {
     // thread per window, main-thread-only — see DispatchUpdate.
     bool dispatchInFlight = false;
     bool dispatchAgainRequested = false;
-    // Set by MoveWindowToNextMonitor right after hiding and placing the
-    // window on the destination monitor; consumed once by the per-window
-    // settle timer, which re-applies the placement and reveals the window
-    // (see RevealMonitorMovePlacementIfPending / kMonitorMoveReassertDelayMs).
     bool pendingMonitorMoveReassert = false;
+    bool pendingMonitorMoveWasHidden = false;
     RECT pendingMonitorMoveRect{};
 };
 
@@ -136,6 +127,9 @@ UINT g_taskbarCreatedMessage = 0;
 bool g_sessionNotificationRegistered = false;
 UINT g_trayRecoveryAttemptsRemaining = 0;
 HorizontalResizeDoubleClickState g_horizontalResizeDoubleClick;
+// Preserve the previous default behavior; the tray menu can disable it for
+// the current process.
+bool g_hideMonitorMoveReposition = true;
 
 // One entry per real top-level window currently being given buttons.
 std::unordered_map<HWND, std::unique_ptr<TrackedWindow>> g_windows;
@@ -1200,30 +1194,21 @@ RECT GetWindowRectForVisibleFrame(HWND hwnd, const RECT& visibleRect,
             visibleRect.right + rightInset, visibleRect.bottom + bottomInset};
 }
 
-// Reveals a window MoveWindowToNextMonitor hid before placing it (see the
-// comment there). Some target apps resize/reposition themselves in response
-// to their own WM_DPICHANGED handling once Windows notices they've crossed
-// onto a differently-scaled monitor — using the DPI-ratio-based rect
-// Windows itself suggests in that message, which differs from the
-// monitor-work-area-percentage rect we compute (confirmed on a real
-// 175%/100% dual-monitor setup: without hiding first, the window visibly
-// snapped to our placement, then immediately resized again). Rather than
-// trying to win a visible race against that, the window stays hidden and
-// off-screen from the user's perspective for kMonitorMoveReassertDelayMs —
-// long enough for that handling to finish — and this then re-applies our
-// rect once more (in case the app did change it while hidden) before
-// revealing it, so only the single, final, correct placement is ever seen.
 void RevealMonitorMovePlacementIfPending(HWND target) {
     auto it = g_windows.find(target);
     if (it == g_windows.end() || !it->second->pendingMonitorMoveReassert) return;
-    it->second->pendingMonitorMoveReassert = false;
+    TrackedWindow& window = *it->second;
+    window.pendingMonitorMoveReassert = false;
 
     if (!IsWindow(target)) return;
     if (!IsIconic(target) && !IsZoomed(target)) {
-        SetWindowPosForVisibleFrame(target, it->second->pendingMonitorMoveRect);
+        SetWindowPosForVisibleFrame(target, window.pendingMonitorMoveRect);
     }
-    ShowWindow(target, SW_SHOW);
-    SetForegroundWindow(target);
+    if (window.pendingMonitorMoveWasHidden) {
+        window.pendingMonitorMoveWasHidden = false;
+        ShowWindow(target, SW_SHOW);
+        SetForegroundWindow(target);
+    }
 }
 
 bool MoveWindowToNextMonitor(HWND hwnd) {
@@ -1298,6 +1283,8 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
     destinationRect.right = destinationRect.left + width;
     destinationRect.bottom = destinationRect.top + height;
 
+    bool hideReposition = g_hideMonitorMoveReposition &&
+                          g_windows.find(hwnd) != g_windows.end();
     bool moved = false;
     if (wasMaximized) {
         placement.rcNormalPosition = GetWindowRectForVisibleFrame(hwnd, destinationRect, currentRect);
@@ -1305,12 +1292,9 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
         moved = SetWindowPlacement(hwnd, &placement) != FALSE;
         if (moved) ShowWindow(hwnd, SW_MAXIMIZE);
     } else {
-        // Hide before placing, and only reveal once RevealMonitorMovePlacementIfPending
-        // is confident the target app's own WM_DPICHANGED handling has
-        // finished (see that function) — otherwise the user would see our
-        // placement immediately followed by the app's own DPI-driven
-        // resize, i.e. two visible size changes instead of one.
-        ShowWindow(hwnd, SW_HIDE);
+        if (hideReposition) {
+            ShowWindow(hwnd, SW_HIDE);
+        }
         SetWindowPosForVisibleFrame(hwnd, destinationRect);
         moved = true;
     }
@@ -1329,20 +1313,15 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
     if (wasMaximized) {
         DispatchUpdate(hwnd);
     } else {
-        // Don't DispatchUpdate here: the window is still hidden, so
-        // ComputeUpdatePlan would find it not ready and — via
-        // ApplyUpdateResult's retryLater path — re-arm this same per-window
-        // timer slot at kOverlaySettleDelayMs (150ms), cutting short the
-        // kMonitorMoveReassertDelayMs (300ms) wait this needs. Setting the
-        // timer directly avoids that race; RevealMonitorMovePlacementIfPending
-        // shows the window and DispatchUpdate follows naturally from the
-        // EVENT_OBJECT_SHOW that generates.
         auto it = g_windows.find(hwnd);
         if (it != g_windows.end()) {
             it->second->pendingMonitorMoveReassert = true;
+            it->second->pendingMonitorMoveWasHidden = hideReposition;
             it->second->pendingMonitorMoveRect = destinationRect;
+            SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(hwnd), kMonitorMoveReassertDelayMs, nullptr);
+        } else {
+            DispatchUpdate(hwnd);
         }
-        SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(hwnd), kMonitorMoveReassertDelayMs, nullptr);
     }
     return true;
 }
@@ -1837,6 +1816,10 @@ void ShowTrayMenu(HWND hwnd) {
     }
     AppendMenuW(menu, startupFlags, ID_TRAY_STARTUP, L"Start automatically with Windows");
 
+    UINT hideRepositionFlags = MF_STRING |
+                              (g_hideMonitorMoveReposition ? MF_CHECKED : MF_UNCHECKED);
+    AppendMenuW(menu, hideRepositionFlags, ID_TRAY_HIDE_REPOSITION, L"Hide Repositioning");
+
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
 
@@ -1903,6 +1886,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             } else if (LOWORD(wParam) == ID_TRAY_STARTUP) {
                 bool currentlyEnabled = IsStartupEnabled();
                 SetStartupEnabled(!currentlyEnabled);
+            } else if (LOWORD(wParam) == ID_TRAY_HIDE_REPOSITION) {
+                g_hideMonitorMoveReposition = !g_hideMonitorMoveReposition;
+                LogDiagnostic("monitor-move hide-reposition=%d",
+                              g_hideMonitorMoveReposition ? 1 : 0);
             } else if (LOWORD(wParam) == ID_TRAY_EXIT) {
                 DestroyWindow(hwnd);
             }
@@ -1963,15 +1950,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ReassertForegroundZOrder();
                 return 0;
             }
-            // Fires as one of three things that all share this one
+            // Fires as one of three things that share this one
             // per-window timer slot (id = the target HWND itself as
             // wParam): the retry from ApplyUpdateResult (a just-restored
             // window's real position wasn't settled yet when we last
             // checked it), the settle-confirmation timer armed by
-            // DispatchUpdate (see kOverlaySettleDelayMs), or the
-            // post-monitor-move reveal armed by MoveWindowToNextMonitor
-            // (see kMonitorMoveReassertDelayMs — the window it hid stays
-            // hidden until this fires). Pass rearmSettleTimer=false to
+            // DispatchUpdate (see kOverlaySettleDelayMs), or the delayed
+            // monitor-move reassertion. The tray setting controls only
+            // whether that reassertion is visibly hidden. Pass
+            // rearmSettleTimer=false to
             // DispatchUpdate: this call *is* the confirmation pass, so it
             // must not re-arm itself.
             KillTimer(hwnd, wParam);
