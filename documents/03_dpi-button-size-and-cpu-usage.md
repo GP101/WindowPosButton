@@ -36,8 +36,7 @@ WindowPosButton은 각 대상 창의 타이틀바 옆에 4개의 오버레이 �
 재계산(`DispatchUpdate` → `ComputeButtonRect`)을 트리거하고, 마지막 이벤트의
 스냅샷이 최종 크기로 굳어지는 구조라 이 문제가 증폭됐다. `MoveWindowToNextMonitor`
 ("다음 모니터로 이동" 버튼)가 모니터 이동 시 창 크기를 DPI 비율로 재조정하지
-않는 점도 이 경합을 더 쉽게 유발하는 부가 요인으로 확인됐다 (이번 수정 범위에는
-포함하지 않음).
+않는 점도 이 경합을 더 쉽게 유발하는 부가 요인으로 확인됐다 (후속 수정, 3절 참고).
 
 ### 적용한 수정
 
@@ -108,11 +107,117 @@ CPU 점유율을 낮추는 것이 중요하다는 요청에 따라 코드를 다
 정상 컴파일 확인. 실사용 중 CPU/디스크 사용량 감소 여부는 실제 배포 환경에서
 확인이 필요하다.
 
-## 변경되지 않은 항목 (참고)
+## 3. 후속 조치 — 다음 모니터 이동 시 DPI 재조정, 스레드 생성 방식 최적화
 
-- `MoveWindowToNextMonitor`가 모니터 이동 시 창 크기를 소스/대상 DPI 비율로
-  재조정하지 않는 문제는 이번 작업 범위에 포함하지 않았다.
-- `MeasureThreadProc`이 디스패치마다 `CreateThread`로 새 스레드를 생성하는
-  부분(코얼레싱으로 폭주는 억제되어 있음)과, `g_locationEventLogs` 맵이 추적
-  대상이 아닌 창의 항목까지 계속 쌓이는 부분(메모리 이슈, CPU 이슈는 아님)은
-  이번 작업에서 우선순위가 낮다고 판단해 보류했다.
+CPU 점유율을 절대 늘리지 않아야 한다는 요구에 따라, 1절에서 부가 요인으로만
+지목했던 `MoveWindowToNextMonitor`와, 2절 이후에도 남아 있던 `CreateThread`
+방식을 마저 손봤다.
+
+### 3-1. `MoveWindowToNextMonitor` — 모니터 작업 영역 비율(%) 유지
+
+기존에는 창을 다음 모니터로 옮길 때 픽셀 크기를 목적지 작업 영역에 맞춰
+**클램프만** 했다. 처음에는 이를 소스/대상 모니터의 DPI 비율(`dpiScale =
+destinationDpi / sourceDpi`)로 재조정하도록 고쳤으나, 사용자가 실제로 원한 동작은
+DPI 비율이 아니라 **모니터 작업 영역에 대한 백분율(%) 그대로 유지**였다 — 예:
+"현재 모니터에서 왼쪽에 붙어서 50%를 차지했다면, 이동한 모니터에서도 왼쪽에
+붙어서 50%가 되어야 한다." DPI 비율과 모니터 해상도(작업 영역 크기) 비율은
+일반적으로 서로 다른 값이므로 DPI 기반 접근으로는 이 요구를 정확히 만족시키지
+못해, 아래와 같이 다시 고쳤다.
+
+`GetVisibleFrameRect`로 구한 소스 창 사각형에서
+`leftRatio`/`topRatio`/`widthRatio`/`heightRatio`(모두 소스 모니터 작업 영역
+대비 비율, `[0, 1]`로 클램프)를 계산한 뒤, 이 비율들을 그대로 대상 모니터
+작업 영역에 적용한다 (`destination.work.left + leftRatio * destinationWidth`
+등). 이 앱의 다른 배치 버튼(`PerformButtonAction`의 SnapLeft/SnapRight/
+Center80, `targetWidth = monWidth * widthRatio`)이 이미 이 방식으로 동작하고
+있어, `MoveWindowToNextMonitor`도 같은 방식으로 통일한 것이다. 이제 사용하지
+않게 된 `GetMonitorDpi(source->monitor)`/`GetMonitorDpi(destination.monitor)`
+호출과 `ScaleWindowPosition`("남는 여백 비율 보존" 방식의 옛 위치 계산
+함수, 유일한 두 호출부가 모두 교체되어 사용처가 없어짐)은 제거했다.
+
+최대화 상태 보존은 별도 손질 없이 그대로 성립한다: 최대화 상태였던 창의
+`sourceRect`는 이미 소스 모니터의 거의 전체(~100%)이므로, 위 비율 공식을 그대로
+적용해도 대상 모니터의 거의 전체(~100%)로 계산되고, 기존 `if (wasMaximized)`
+분기(복원 위치로 이동 → `ShowWindow(SW_MAXIMIZE)`로 재최대화)가 대상 모니터에서
+정확히 재최대화한다.
+
+#### 3-1-1. 실기기 테스트에서 발견된 추가 결함 — 배치 직후 크기가 다시 바뀜
+
+실제 175%(왼쪽)/100%(오른쪽) 듀얼 모니터에서 테스트한 결과, 위 비율 계산 자체는
+정확했지만(사용자 확인: "이동한 위치와 크기는 정확한 것 같다"), **배치 직후
+크기가 한 번 더 바뀌는** 문제가 관찰됐다. 원인은 우리 코드가 아니라 Windows의
+DPI 가상화다: 창이 DPI가 다른 모니터로 넘어가면 Windows가 대상 창에
+`WM_DPICHANGED`를 보내고, DPI 인식 앱은 보통 이 메시지에 반응해 스스로
+크기/위치를 재조정한다 — 이때 앱이 쓰는 스케일링 기준(보통 DPI 비율 기반)이
+우리가 방금 적용한 "모니터 작업 영역 %" 기준과 달라, 우리가 배치한 직후에
+창이 다시 어긋난 크기로 바뀌는 것으로 보인다. 이는 대상 프로세스 자체의 메시지
+처리이므로 WindowPosButton이 직접 막을 수는 없다.
+
+**1차 시도 — "마지막에 다시 덮어쓰기"(실패)**: `MoveWindowToNextMonitor`가
+비최대화 창을 배치한 뒤 목표 사각형을 기억해뒀다가, `kMonitorMoveReassertDelayMs
+= 300ms` 뒤 같은 사각형을 한 번 더 적용하는 방식으로 처음 구현했다. 실기기로
+확인해 보니 "정확히 배치됨 → (300ms 동안) 잘못된 크기로 유지 → 300ms 뒤 다시
+정확한 크기로 튐"처럼 **두 번의 뚜렷한 크기 변화**로 보여 시각적으로 좋지
+않았다. `EVENT_OBJECT_LOCATIONCHANGE` 훅에서 즉시(다음 프레임 수준으로) 재적용
+하도록 반응 속도를 높이는 것도 시도했지만, 사용자가 재확인한 결과 여전히 두 번
+바뀌는 것처럼 보였다 — 대상 앱이 자기 방식대로 잘못된 크기로 렌더링하는 순간이
+아무리 짧아도 화면에 한 프레임이라도 노출되면 사람 눈에는 "두 번 조정"으로
+읽히기 때문이다. Microsoft의 공식 DPI 인식 가이드도 "`WM_DPICHANGED`의
+`lParam`이 제안하는 사각형을 그대로 적용하라"고 안내하므로, 잘 만들어진
+DPI 인식 앱일수록 오히려 이 문제를 더 확실히 일으킨다 — 즉 아무리 빨리
+반응해도 근본적으로 한 번의 "튀는" 프레임을 완전히 없앨 수는 없었다.
+
+**2차 시도 — "숨겼다가 최종 상태로만 보여주기"(채택)**: 대신, 비최대화 창을
+배치하기 직전에 `ShowWindow(hwnd, SW_HIDE)`로 숨긴 뒤 목표 사각형을 적용한다.
+숨겨진 상태에서는 대상 앱이 `WM_DPICHANGED`에 반응해 스스로 크기를 몇 번을
+바꾸든 DWM이 그 창을 합성(렌더링)하지 않으므로 화면에 전혀 노출되지 않는다.
+`kMonitorMoveReassertDelayMs`(300ms) 뒤 `RevealMonitorMovePlacementIfPending`가
+호출되어, 창이 아직 그 자리에 있으면(최소화/최대화되지 않았으면)
+`SetWindowPosForVisibleFrame`로 목표 사각형을 한 번 더 적용해 대상 앱이 숨어
+있는 동안 바꿔놓았을 수 있는 값을 덮어쓴 다음, `ShowWindow(SW_SHOW)` +
+`SetForegroundWindow`로 그제서야 화면에 드러낸다. 사용자에게는 버튼을 누르고
+약간의(300ms) 지연 후 창이 정확한 위치/크기로 "한 번만" 나타나는 것으로
+보인다 — 중간 과정이 전혀 보이지 않으므로 두 번 조정되는 문제가 근본적으로
+사라진다.
+
+이 접근에서는 사각형을 실제로 비교해 "정말 바뀌었을 때만" 재적용하는 이벤트
+기반 경로가 더 이상 필요 없어 제거했다(숨겨진 동안은 몇 번을 재적용해도 아무
+것도 보이지 않으므로, 빠르게 반응할 이유가 없다). 대신 `MoveWindowToNextMonitor`
+가 숨긴 직후 `DispatchUpdate(hwnd)`를 호출하지 않도록 주의했다 — 창이 아직
+숨겨져 있으면 `ComputeUpdatePlan`이 "준비 안 됨"으로 보고, `ApplyUpdateResult`의
+재시도 경로가 같은 per-window 타이머 슬롯을 `kOverlaySettleDelayMs`(150ms)로
+다시 예약해 우리의 300ms 대기를 단축시켜 버리는 경합이 있었기 때문이다. 대신
+`RevealMonitorMovePlacementIfPending`가 창을 보이게 하면 그때 발생하는
+`EVENT_OBJECT_SHOW`가 자연스럽게 `DispatchUpdate`를 트리거하도록 맡긴다.
+
+최대화 상태였던 창은 `ShowWindow(SW_MAXIMIZE)`로 대상 모니터 작업 영역에 맞춰
+다시 계산되므로 이 숨김/재적용 대상에서 제외했다 (기존 방식 그대로 유지 —
+실기기에서 별도 문제가 보고되지 않았고, 최대화 창의 중간 상태를 안전하게
+숨기는 방법은 검증 없이 바꾸기엔 위험 부담이 커 보류했다).
+
+### 3-2. 측정 스레드: `CreateThread` → OS 스레드 풀(`QueueUserWorkItem`)
+
+`MeasureThreadProc`은 디스패치마다(코얼레싱으로 폭주는 막혀 있지만, 창이
+여러 개거나 이벤트가 잦으면 여전히 빈번함) `CreateThread`로 새 OS 스레드를
+만들고 바로 버렸다. 스레드 생성/종료는 몇 개의 DWM/GDI 호출로 이뤄지는 실제
+작업량에 비해 커널 오버헤드(스택 예약, 커널 객체 생성/해제 등)가 큰 편이라,
+CPU 점유율 관점에서 불필요한 비용이었다.
+
+`CreateThread`/`CloseHandle`를 `QueueUserWorkItem(MeasureThreadProc, param,
+WT_EXECUTELONGFUNCTION)`로 교체했다. 프로세스 공용 스레드 풀이 워커 스레드를
+재사용하므로, 디스패치마다 스레드를 새로 만들고 없애는 비용이 사라지고
+동작(각 창 독립적으로 비동기 처리, 결과는 `WM_OVERLAY_RESULT`로 메인 스레드에
+전달)은 그대로 유지된다. `WT_EXECUTELONGFUNCTION`은 느리거나 멈춘 DWM
+호출(기존 주석에서 언급된 "pathological case") 때문에 풀의 다른 작업이 밀리지
+않도록 하는 힌트다.
+
+### 검증
+
+`MSBuild WindowPosButton.vcxproj /p:Configuration=Release /p:Platform=x64`로
+정상 컴파일 확인. 실제 175%↔100% 모니터 간 이동 시 창/버튼 크기 육안 검증과,
+장시간 사용 시 CPU 사용량 비교는 개발 환경 제약으로 수행하지 못했다.
+
+## 남아 있는 항목 (참고)
+
+- `g_locationEventLogs` 맵이 추적 대상이 아닌 창의 항목까지 계속 쌓이는 부분은
+  메모리 이슈이며 CPU 이슈는 아니라 이번 작업에서는 보류했다.

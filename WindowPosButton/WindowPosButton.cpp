@@ -76,7 +76,18 @@ constexpr UINT kHorizontalResizeDoubleClickIntervalMs = 15;
 // mid-transition sample happened to be the last one measured.
 constexpr UINT kOverlaySettleDelayMs = 150;
 
-constexpr wchar_t kAppVersion[] = L"1.1";
+// How long MoveWindowToNextMonitor keeps a (non-maximized) window hidden
+// after placing it, before RevealMonitorMovePlacementIfPending re-applies
+// the placement once more and shows it. When a window crosses onto a
+// differently-scaled monitor, Windows sends it WM_DPICHANGED, and a
+// DPI-aware target app's own handling of that message can resize/reposition
+// itself right after we place it — overwriting the size/position ratio we
+// just computed. This is longer than kOverlaySettleDelayMs because it waits
+// on a third-party app's own message handling, not just our own DWM
+// queries.
+constexpr UINT kMonitorMoveReassertDelayMs = 300;
+
+constexpr wchar_t kAppVersion[] = L"1.2";
 
 enum class ButtonAction { SnapLeft, SnapRight, MoveNextMonitor, Center80 };
 enum class ButtonVariant { Normal, RightClick, ShiftLeftClick };
@@ -100,6 +111,12 @@ struct TrackedWindow {
     // thread per window, main-thread-only — see DispatchUpdate.
     bool dispatchInFlight = false;
     bool dispatchAgainRequested = false;
+    // Set by MoveWindowToNextMonitor right after hiding and placing the
+    // window on the destination monitor; consumed once by the per-window
+    // settle timer, which re-applies the placement and reveals the window
+    // (see RevealMonitorMovePlacementIfPending / kMonitorMoveReassertDelayMs).
+    bool pendingMonitorMoveReassert = false;
+    RECT pendingMonitorMoveRect{};
 };
 
 enum class HorizontalResizeEdge { None, Left, Right };
@@ -273,7 +290,8 @@ void InitializeDiagnosticLog() {
     MoveFileExW(g_diagnosticLogPath.c_str(), previousPath.c_str(), MOVEFILE_REPLACE_EXISTING);
 
     _wfopen_s(&g_diagnosticLogFile, g_diagnosticLogPath.c_str(), L"ab");
-    LogDiagnostic("app-start version=1.1 log=\"%s\"", WideToUtf8(g_diagnosticLogPath).c_str());
+    LogDiagnostic("app-start version=%s log=\"%s\"", WideToUtf8(kAppVersion).c_str(),
+                  WideToUtf8(g_diagnosticLogPath).c_str());
 }
 
 void ShutdownDiagnosticLog() {
@@ -880,9 +898,9 @@ struct MeasureThreadParam {
     HWND target;
 };
 
-// Entry point for a one-shot measurement thread: does all the (possibly
+// Entry point for a one-shot measurement work item: does all the (possibly
 // slow, cross-process) querying for one window, then hands the result to the
-// main thread via a posted message and exits. Never touches g_windows,
+// main thread via a posted message and returns. Never touches g_windows,
 // TrackedWindow, or any OverlayButton, so it needs no lock — there is
 // nothing shared to protect.
 DWORD WINAPI MeasureThreadProc(LPVOID param) {
@@ -897,10 +915,18 @@ DWORD WINAPI MeasureThreadProc(LPVOID param) {
     return 0;
 }
 
+// Runs MeasureThreadProc on the process's shared OS thread pool
+// (QueueUserWorkItem) instead of spinning up a brand-new thread per
+// dispatch. A fresh CreateThread/ExitThread pair costs real, avoidable CPU
+// for work this small (a handful of DWM/GDI queries); the pool instead
+// parks and reuses a small number of worker threads, which sit idle between
+// dispatches exactly like a one-shot thread would, just without the
+// per-call creation/teardown cost. WT_EXECUTELONGFUNCTION tells the pool
+// not to treat a slow/blocked DWM call (see below) as a reason to delay
+// other queued work — it just grows the pool instead.
 void SpawnMeasureThread(HWND target) {
     auto* param = new MeasureThreadParam{target};
-    HANDLE thread = CreateThread(nullptr, 0, MeasureThreadProc, param, 0, nullptr);
-    if (!thread) {
+    if (!QueueUserWorkItem(MeasureThreadProc, param, WT_EXECUTELONGFUNCTION)) {
         delete param;
         auto it = g_windows.find(target);
         if (it != g_windows.end()) it->second->dispatchInFlight = false;
@@ -910,7 +936,6 @@ void SpawnMeasureThread(HWND target) {
     // completion (or, in the pathological case of a truly hung DWM call,
     // sits blocked indefinitely) on its own, entirely independent of the
     // main thread and every other window's dispatch.
-    CloseHandle(thread);
 }
 
 // Single entry point for "window X may need its overlays refreshed". Safe to
@@ -1175,18 +1200,30 @@ RECT GetWindowRectForVisibleFrame(HWND hwnd, const RECT& visibleRect,
             visibleRect.right + rightInset, visibleRect.bottom + bottomInset};
 }
 
-LONG ScaleWindowPosition(LONG position, LONG sourceStart, LONG sourceSize,
-                         LONG windowSize, LONG destinationStart, LONG destinationSize) {
-    LONG sourceRange = sourceSize - windowSize;
-    if (sourceRange < 0) sourceRange = 0;
-    LONG destinationRange = destinationSize - windowSize;
-    if (destinationRange < 0) destinationRange = 0;
-    if (sourceRange == 0) return destinationStart + destinationRange / 2;
+// Reveals a window MoveWindowToNextMonitor hid before placing it (see the
+// comment there). Some target apps resize/reposition themselves in response
+// to their own WM_DPICHANGED handling once Windows notices they've crossed
+// onto a differently-scaled monitor — using the DPI-ratio-based rect
+// Windows itself suggests in that message, which differs from the
+// monitor-work-area-percentage rect we compute (confirmed on a real
+// 175%/100% dual-monitor setup: without hiding first, the window visibly
+// snapped to our placement, then immediately resized again). Rather than
+// trying to win a visible race against that, the window stays hidden and
+// off-screen from the user's perspective for kMonitorMoveReassertDelayMs —
+// long enough for that handling to finish — and this then re-applies our
+// rect once more (in case the app did change it while hidden) before
+// revealing it, so only the single, final, correct placement is ever seen.
+void RevealMonitorMovePlacementIfPending(HWND target) {
+    auto it = g_windows.find(target);
+    if (it == g_windows.end() || !it->second->pendingMonitorMoveReassert) return;
+    it->second->pendingMonitorMoveReassert = false;
 
-    double ratio = static_cast<double>(position - sourceStart) / static_cast<double>(sourceRange);
-    if (ratio < 0.0) ratio = 0.0;
-    if (ratio > 1.0) ratio = 1.0;
-    return destinationStart + static_cast<LONG>(ratio * destinationRange + 0.5);
+    if (!IsWindow(target)) return;
+    if (!IsIconic(target) && !IsZoomed(target)) {
+        SetWindowPosForVisibleFrame(target, it->second->pendingMonitorMoveRect);
+    }
+    ShowWindow(target, SW_SHOW);
+    SetForegroundWindow(target);
 }
 
 bool MoveWindowToNextMonitor(HWND hwnd) {
@@ -1232,15 +1269,32 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
     LONG sourceHeight = source->work.bottom - source->work.top;
     LONG destinationWidth = destination.work.right - destination.work.left;
     LONG destinationHeight = destination.work.bottom - destination.work.top;
-    LONG width = sourceRect.right - sourceRect.left;
-    if (width > destinationWidth) width = destinationWidth;
-    LONG height = sourceRect.bottom - sourceRect.top;
-    if (height > destinationHeight) height = destinationHeight;
+
+    // Preserve the window's placement as a fraction of its monitor's work
+    // area across the move — e.g. "flush left, 50% width" on the source
+    // monitor stays "flush left, 50% width" on the destination monitor,
+    // regardless of the two monitors' resolution or DPI. This matches how
+    // this app's own snap buttons already place windows (see
+    // PerformButtonAction's SnapLeft/SnapRight/Center80, which size windows
+    // as monitor-work-area-width * ratio) rather than trying to preserve an
+    // absolute pixel or DPI-scaled size.
+    auto clampUnit = [](double ratio) {
+        if (ratio < 0.0) return 0.0;
+        if (ratio > 1.0) return 1.0;
+        return ratio;
+    };
+    double leftRatio = clampUnit(static_cast<double>(sourceRect.left - source->work.left) / sourceWidth);
+    double topRatio = clampUnit(static_cast<double>(sourceRect.top - source->work.top) / sourceHeight);
+    double widthRatio = clampUnit(static_cast<double>(sourceRect.right - sourceRect.left) / sourceWidth);
+    double heightRatio = clampUnit(static_cast<double>(sourceRect.bottom - sourceRect.top) / sourceHeight);
+
     RECT destinationRect{};
-    destinationRect.left = ScaleWindowPosition(sourceRect.left, source->work.left, sourceWidth,
-                                               width, destination.work.left, destinationWidth);
-    destinationRect.top = ScaleWindowPosition(sourceRect.top, source->work.top, sourceHeight,
-                                              height, destination.work.top, destinationHeight);
+    destinationRect.left = destination.work.left + static_cast<LONG>(leftRatio * destinationWidth + 0.5);
+    destinationRect.top = destination.work.top + static_cast<LONG>(topRatio * destinationHeight + 0.5);
+    LONG width = static_cast<LONG>(widthRatio * destinationWidth + 0.5);
+    if (width > destinationWidth) width = destinationWidth;
+    LONG height = static_cast<LONG>(heightRatio * destinationHeight + 0.5);
+    if (height > destinationHeight) height = destinationHeight;
     destinationRect.right = destinationRect.left + width;
     destinationRect.bottom = destinationRect.top + height;
 
@@ -1251,6 +1305,12 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
         moved = SetWindowPlacement(hwnd, &placement) != FALSE;
         if (moved) ShowWindow(hwnd, SW_MAXIMIZE);
     } else {
+        // Hide before placing, and only reveal once RevealMonitorMovePlacementIfPending
+        // is confident the target app's own WM_DPICHANGED handling has
+        // finished (see that function) — otherwise the user would see our
+        // placement immediately followed by the app's own DPI-driven
+        // resize, i.e. two visible size changes instead of one.
+        ShowWindow(hwnd, SW_HIDE);
         SetWindowPosForVisibleFrame(hwnd, destinationRect);
         moved = true;
     }
@@ -1260,11 +1320,30 @@ bool MoveWindowToNextMonitor(HWND hwnd) {
         return false;
     }
 
-    LogDiagnostic("move-next-monitor source=(%ld,%ld,%ld,%ld) destination=(%ld,%ld,%ld,%ld) maximized=%d",
+    LogDiagnostic("move-next-monitor source=(%ld,%ld,%ld,%ld) destination=(%ld,%ld,%ld,%ld) "
+                  "leftRatio=%.3f topRatio=%.3f widthRatio=%.3f heightRatio=%.3f maximized=%d",
                   source->work.left, source->work.top, source->work.right, source->work.bottom,
                   destination.work.left, destination.work.top, destination.work.right, destination.work.bottom,
-                  wasMaximized ? 1 : 0);
-    DispatchUpdate(hwnd);
+                  leftRatio, topRatio, widthRatio, heightRatio, wasMaximized ? 1 : 0);
+
+    if (wasMaximized) {
+        DispatchUpdate(hwnd);
+    } else {
+        // Don't DispatchUpdate here: the window is still hidden, so
+        // ComputeUpdatePlan would find it not ready and — via
+        // ApplyUpdateResult's retryLater path — re-arm this same per-window
+        // timer slot at kOverlaySettleDelayMs (150ms), cutting short the
+        // kMonitorMoveReassertDelayMs (300ms) wait this needs. Setting the
+        // timer directly avoids that race; RevealMonitorMovePlacementIfPending
+        // shows the window and DispatchUpdate follows naturally from the
+        // EVENT_OBJECT_SHOW that generates.
+        auto it = g_windows.find(hwnd);
+        if (it != g_windows.end()) {
+            it->second->pendingMonitorMoveReassert = true;
+            it->second->pendingMonitorMoveRect = destinationRect;
+        }
+        SetTimer(g_hMain, reinterpret_cast<UINT_PTR>(hwnd), kMonitorMoveReassertDelayMs, nullptr);
+    }
     return true;
 }
 
@@ -1884,15 +1963,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 ReassertForegroundZOrder();
                 return 0;
             }
-            // Fires either as the retry from ApplyUpdateResult (a
-            // just-restored window's real position wasn't settled yet when
-            // we last checked it) or as the settle-confirmation timer armed
-            // by DispatchUpdate (see kOverlaySettleDelayMs) — both share
-            // this one per-window timer slot, keyed by the target HWND
-            // itself as wParam. Pass rearmSettleTimer=false: this call *is*
-            // the confirmation pass, so it must not re-arm itself.
+            // Fires as one of three things that all share this one
+            // per-window timer slot (id = the target HWND itself as
+            // wParam): the retry from ApplyUpdateResult (a just-restored
+            // window's real position wasn't settled yet when we last
+            // checked it), the settle-confirmation timer armed by
+            // DispatchUpdate (see kOverlaySettleDelayMs), or the
+            // post-monitor-move reveal armed by MoveWindowToNextMonitor
+            // (see kMonitorMoveReassertDelayMs — the window it hid stays
+            // hidden until this fires). Pass rearmSettleTimer=false to
+            // DispatchUpdate: this call *is* the confirmation pass, so it
+            // must not re-arm itself.
             KillTimer(hwnd, wParam);
             LogWindowDiagnostic(reinterpret_cast<HWND>(wParam), "WM_TIMER.retry");
+            RevealMonitorMovePlacementIfPending(reinterpret_cast<HWND>(wParam));
             DispatchUpdate(reinterpret_cast<HWND>(wParam), /*rearmSettleTimer=*/false);
             return 0;
         }
