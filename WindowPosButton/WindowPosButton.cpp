@@ -1366,6 +1366,33 @@ void PerformButtonAction(HWND hwnd, ButtonAction action,
                                                                : work.right - targetWidth;
             RECT targetFrame = {targetX, work.top, targetX + targetWidth, work.bottom};
             SetWindowPosForVisibleFrame(hwnd, targetFrame);
+
+            // If snapping right, the app may have a minimum width that prevented
+            // the window from shrinking to targetWidth. In that case the window's
+            // left edge was placed at targetX but its actual width is larger, so
+            // the visible right edge overflows the monitor. Read the actual visible
+            // frame and shift the window left until its right edge aligns with
+            // work.right.
+            if (action == ButtonAction::SnapRight) {
+                RECT actualWindow{};
+                RECT actualFrame{};
+                if (GetWindowRect(hwnd, &actualWindow) &&
+                    SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                                    &actualFrame, sizeof(actualFrame)))) {
+                    if (actualFrame.right > work.right) {
+                        // Shift the non-client rect left by the same amount the
+                        // visible right edge overflows the monitor work area.
+                        LONG overflow = actualFrame.right - work.right;
+                        LONG newLeft = actualWindow.left - overflow;
+                        SetWindowPos(hwnd, nullptr, newLeft, actualWindow.top,
+                                     actualWindow.right - actualWindow.left,
+                                     actualWindow.bottom - actualWindow.top,
+                                     SWP_NOZORDER | SWP_NOACTIVATE);
+                        LogWindowDiagnostic(hwnd, "snap-right-overflow-corrected",
+                                            "overflow=%ld newLeft=%ld", overflow, newLeft);
+                    }
+                }
+            }
         }
         return;
     }
