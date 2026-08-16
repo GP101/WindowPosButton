@@ -86,7 +86,7 @@ constexpr UINT kMonitorMoveReassertDelayMs = 300;
 constexpr wchar_t kAppVersion[] = L"1.2";
 
 enum class ButtonAction { SnapLeft, SnapRight, MoveNextMonitor, Center80 };
-enum class ButtonVariant { Normal, RightClick, ShiftLeftClick };
+enum class ButtonVariant { Normal, RightClick, ShiftLeftClick, ShiftRightClick };
 
 struct OverlayButton {
     HWND hwnd = nullptr;
@@ -1362,7 +1362,8 @@ void PerformButtonAction(HWND hwnd, ButtonAction action,
             LONG monHeight = work.bottom - work.top;
             double widthRatio = variant == ButtonVariant::RightClick ? 0.7
                               : variant == ButtonVariant::ShiftLeftClick ? 0.3
-                                                                         : 0.5;
+                              : variant == ButtonVariant::ShiftRightClick ? 0.4
+                                                                          : 0.5;
             LONG targetWidth = static_cast<LONG>(monWidth * widthRatio);
             LONG targetX = (action == ButtonAction::SnapLeft) ? work.left
                                                                : work.right - targetWidth;
@@ -1561,7 +1562,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RenderAndPositionOverlay(*button, rc);
 
             if (wasPressed && PtInRect(&rc, pt)) {
-                PerformButtonAction(button->target, button->action, ButtonVariant::RightClick);
+                ButtonVariant variant = (wParam & MK_SHIFT) != 0
+                                            ? ButtonVariant::ShiftRightClick
+                                            : ButtonVariant::RightClick;
+                PerformButtonAction(button->target, button->action, variant);
             }
             return 0;
         }
@@ -1913,8 +1917,8 @@ void ShowAboutWindow(HWND owner) {
     const std::wstring text = std::wstring(L"WindowPosButton ") + kAppVersion +
         L"\n\n"
         L"Adds buttons to the left of the minimize button in every window title bar:\n\n"
-        L"  • Snap left (50% width; Shift+left click: 30% width; right click: 70% width)\n"
-        L"  • Snap right (50% width; Shift+left click: 30% width; right click: 70% width)\n"
+        L"  • Snap left (50% width; Shift+left click: 30% width; right click: 70% width; Shift+right click: 40% width)\n"
+        L"  • Snap right (50% width; Shift+left click: 30% width; right click: 70% width; Shift+right click: 40% width)\n"
         L"  • Move to next monitor (cycles through display layout order; right click: expand across all monitors)\n"
         L"  • Center at 80% (80% of the current display width at 16:9, centered in the work area; right click: full height)\n\n"
         L"This application runs with administrator privileges so the buttons are available on elevated windows.\n\n"
