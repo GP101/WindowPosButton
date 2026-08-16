@@ -36,6 +36,8 @@ constexpr wchar_t kMainClassName[] = L"WindowPosButton_Main";
 constexpr wchar_t kMutexName[] = L"Local\\WindowPosButton_SingleInstance";
 constexpr wchar_t kStartupTaskName[] = L"WindowPosButton";
 constexpr wchar_t kLegacyRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kSettingsKeyPath[] = L"Software\\jintaeks\\WindowPosButton";
+constexpr wchar_t kHideRepositionSettingName[] = L"HideRepositioning";
 
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 // Delivers a completed UpdateResult* from a one-shot measurement thread back
@@ -127,8 +129,8 @@ UINT g_taskbarCreatedMessage = 0;
 bool g_sessionNotificationRegistered = false;
 UINT g_trayRecoveryAttemptsRemaining = 0;
 HorizontalResizeDoubleClickState g_horizontalResizeDoubleClick;
-// Preserve the previous default behavior; the tray menu can disable it for
-// the current process.
+// Preserve the previous default behavior unless the user has saved a
+// different preference in the tray menu.
 bool g_hideMonitorMoveReposition = true;
 
 // One entry per real top-level window currently being given buttons.
@@ -1583,6 +1585,52 @@ void DeleteLegacyStartupValue() {
     }
 }
 
+void LoadHideRepositionSetting() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKeyPath, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) {
+        return;
+    }
+
+    DWORD value = 0;
+    DWORD valueSize = sizeof(value);
+    DWORD valueType = 0;
+    LONG result = RegQueryValueExW(hKey, kHideRepositionSettingName, nullptr, &valueType,
+                                   reinterpret_cast<BYTE*>(&value), &valueSize);
+    RegCloseKey(hKey);
+
+    if (result == ERROR_SUCCESS && valueType == REG_DWORD && valueSize == sizeof(value)) {
+        g_hideMonitorMoveReposition = value != 0;
+        LogDiagnostic("monitor-move hide-reposition-loaded=%d",
+                      g_hideMonitorMoveReposition ? 1 : 0);
+    } else if (result != ERROR_FILE_NOT_FOUND) {
+        LogDiagnostic("monitor-move hide-reposition-load-failed error=%ld", result);
+    }
+}
+
+bool SaveHideRepositionSetting() {
+    HKEY hKey = nullptr;
+    DWORD disposition = 0;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKeyPath, 0, nullptr,
+                                  REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
+                                  &hKey, &disposition);
+    if (result != ERROR_SUCCESS) {
+        LogDiagnostic("monitor-move hide-reposition-save-key-failed error=%ld", result);
+        return false;
+    }
+
+    DWORD value = g_hideMonitorMoveReposition ? 1 : 0;
+    result = RegSetValueExW(hKey, kHideRepositionSettingName, 0, REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDiagnostic("monitor-move hide-reposition-save-failed error=%ld", result);
+        return false;
+    }
+
+    LogDiagnostic("monitor-move hide-reposition-saved=%d", value);
+    return true;
+}
+
 bool ConnectTaskScheduler(ComPtr<ITaskService>& service, ComPtr<ITaskFolder>& rootFolder) {
     HRESULT hr = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_ITaskService, reinterpret_cast<void**>(service.put()));
@@ -1915,6 +1963,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 SetStartupEnabled(!currentlyEnabled);
             } else if (LOWORD(wParam) == ID_TRAY_HIDE_REPOSITION) {
                 g_hideMonitorMoveReposition = !g_hideMonitorMoveReposition;
+                SaveHideRepositionSetting();
                 LogDiagnostic("monitor-move hide-reposition=%d",
                               g_hideMonitorMoveReposition ? 1 : 0);
             } else if (LOWORD(wParam) == ID_TRAY_EXIT) {
@@ -2102,6 +2151,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     }
 
     InitializeDiagnosticLog();
+    LoadHideRepositionSetting();
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
